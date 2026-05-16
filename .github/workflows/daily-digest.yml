@@ -9,6 +9,7 @@ on:
 permissions:
   contents: write
   issues: write
+  models: read
 
 jobs:
   digest:
@@ -35,13 +36,13 @@ jobs:
 
       - name: Run daily digest
         env:
+          LLM_PROVIDER: github-copilot
+          GITHUB_COPILOT_MODEL: openai/gpt-4o
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           PRODUCTHUNT_TOKEN: ${{ secrets.PRODUCTHUNT_TOKEN }}
           DIGEST_REPO: ${{ github.repository }}
         run: pnpm start
+
 
       - name: Commit digest files
         run: |
@@ -78,9 +79,12 @@ jobs:
 
       - name: Send Feishu notification
         env:
-          FEISHU_WEBHOOK_URLS: ${{ secrets.FEISHU_WEBHOOK_URLS }}
-          PAGES_URL: https://duanyytop.github.io/agents-radar
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
+          PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
         run: pnpm notify:feishu
+
 
       - name: Close stale issues
         env:
