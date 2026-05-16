@@ -1,118 +1,118 @@
-/**
- * Feishu (Lark) notification — reads manifest.json and sends a card message
- * with links to the latest reports. Skips silently if secrets are not set.
- *
- * Required env vars:
- *   FEISHU_WEBHOOK_URLS — comma-separated list of custom bot webhook URLs
- *                         (also accepts legacy FEISHU_WEBHOOK_URL for one URL)
- * Optional:
- *   PAGES_URL           — GitHub Pages base URL (defaults to the public deployment)
- */
-
 import fs from "node:fs";
 import path from "node:path";
 import { NOTIFY_LABELS } from "./i18n.ts";
 import type { Highlights } from "./notify.ts";
 
-const PAGES_URL_DEFAULT = "https://duanyytop.github.io/agents-radar";
-
-function getWebhookUrls(): string[] {
-  const raw = process.env["FEISHU_WEBHOOK_URLS"] ?? process.env["FEISHU_WEBHOOK_URL"] ?? "";
-  return raw
-    .split(",")
-    .map((u) => u.trim())
-    .filter(Boolean);
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing required environment variable: ${name}`);
+  return value;
 }
 
-async function sendToOneWebhook(webhookUrl: string, title: string, content: string): Promise<void> {
-  const res = await fetch(webhookUrl, {
+function resolvePagesUrl(): string {
+  const configured = process.env["PAGES_URL"];
+  if (configured) return configured.replace(/\/$/, "");
+
+  const repository = process.env["GITHUB_REPOSITORY"];
+  if (repository) {
+    const [owner, repo] = repository.split("/", 2);
+    if (owner && repo) return `https://${owner}.github.io/${repo}`;
+  }
+
+  return "https://duanyytop.github.io/agents-radar";
+}
+
+async function getTenantAccessToken(appId: string, appSecret: string): Promise<string> {
+  const res = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      msg_type: "interactive",
-      card: {
-        header: {
-          title: { tag: "plain_text", content: title },
-          template: "blue",
-        },
-        elements: [{ tag: "markdown", content }],
-      },
+      app_id: appId,
+      app_secret: appSecret,
     }),
   });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Feishu API ${res.status}: ${body}`);
+
+  const json = (await res.json()) as {
+    code?: number;
+    msg?: string;
+    tenant_access_token?: string;
+  };
+
+  if (!res.ok || json.code !== 0 || !json.tenant_access_token) {
+    throw new Error(`Feishu auth failed: ${json.msg ?? res.statusText}`);
   }
+
+  return json.tenant_access_token;
 }
 
-async function sendFeishu(title: string, content: string): Promise<void> {
-  const urls = getWebhookUrls();
-  const results = await Promise.allSettled(urls.map((url) => sendToOneWebhook(url, title, content)));
-  const failures = results.filter((r) => r.status === "rejected");
-  if (failures.length) {
-    const msgs = failures.map((r) => (r as PromiseRejectedResult).reason);
-    console.error(`[feishu] ${failures.length}/${urls.length} webhook(s) failed:`, msgs);
-    if (failures.length === urls.length) throw new Error("All Feishu webhooks failed");
-  }
-}
-
-export function buildFeishuMessage(
+function buildFeishuText(
   date: string,
   reports: string[],
-  pagesUrl?: string,
   highlights?: Highlights | null,
 ): string {
-  const PAGES_URL = (pagesUrl ?? process.env["PAGES_URL"] ?? PAGES_URL_DEFAULT).replace(/\/$/, "");
+  const pagesUrl = resolvePagesUrl();
   const baseReports = reports.filter((r) => !r.endsWith("-en"));
-  const isWeekly = baseReports.includes("ai-weekly");
-  const isMonthly = baseReports.includes("ai-monthly");
-
-  const icon = isMonthly ? "📆" : isWeekly ? "📅" : "📡";
-  const suffix = isMonthly ? " 月报" : isWeekly ? " 周报" : "";
-  const lines: string[] = [`${icon} **agents-radar${suffix} · ${date}**`];
-
-  const ordered = [
-    ...baseReports.filter((r) => !r.includes("weekly") && !r.includes("monthly")),
-    ...baseReports.filter((r) => r.includes("weekly") || r.includes("monthly")),
-  ];
-
   const zhHighlights = highlights?.zh ?? {};
 
-  for (const r of ordered) {
+  const lines: string[] = [`agents-radar ${date}`];
+
+  for (const r of baseReports) {
     const zhLabel = NOTIFY_LABELS[r]?.zh ?? r;
-    const zhUrl = `${PAGES_URL}/#${date}/${r}`;
+    const zhUrl = `${pagesUrl}/#${date}/${r}`;
     const enKey = `${r}-en`;
 
     lines.push("");
+    lines.push(`${zhLabel}: ${zhUrl}`);
+
     if (reports.includes(enKey)) {
-      const enLabel = NOTIFY_LABELS[r]?.en ?? "EN";
-      const enUrl = `${PAGES_URL}/#${date}/${enKey}`;
-      lines.push(`• [${zhLabel}](${zhUrl})  ·  [${enLabel}](${enUrl})`);
-    } else {
-      lines.push(`• [${zhLabel}](${zhUrl})`);
+      const enUrl = `${pagesUrl}/#${date}/${enKey}`;
+      lines.push(`EN: ${enUrl}`);
     }
 
     const items = zhHighlights[r];
     if (items?.length) {
       for (const h of items) {
-        lines.push(`  ◦ ${h}`);
+        lines.push(`- ${h}`);
       }
     }
   }
 
-  lines.push(`\n[🌐 Web UI](${PAGES_URL})  ·  [⊕ RSS](${PAGES_URL}/feed.xml)`);
+  lines.push("");
+  lines.push(`Web UI: ${pagesUrl}`);
+  lines.push(`RSS: ${pagesUrl}/feed.xml`);
   return lines.join("\n");
 }
 
-async function main(): Promise<void> {
-  const urls = getWebhookUrls();
-  if (!urls.length) {
-    console.log("[feishu] FEISHU_WEBHOOK_URLS not set — skipping.");
-    return;
-  }
+async function sendFeishu(text: string): Promise<void> {
+  const appId = requireEnv("FEISHU_APP_ID");
+  const appSecret = requireEnv("FEISHU_APP_SECRET");
+  const chatId = requireEnv("FEISHU_CHAT_ID");
 
+  const token = await getTenantAccessToken(appId, appSecret);
+
+  const res = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      receive_id: chatId,
+      msg_type: "text",
+      content: JSON.stringify({ text }),
+    }),
+  });
+
+  const json = (await res.json()) as { code?: number; msg?: string };
+
+  if (!res.ok || json.code !== 0) {
+    throw new Error(`Feishu send failed: ${json.msg ?? res.statusText}`);
+  }
+}
+
+async function main(): Promise<void> {
   if (!fs.existsSync("manifest.json")) {
-    console.log("[feishu] manifest.json not found — skipping.");
+    console.log("[feishu] manifest.json not found - skipping.");
     return;
   }
 
@@ -122,9 +122,10 @@ async function main(): Promise<void> {
 
   const latest = dates?.[0];
   if (!latest) {
-    console.log("[feishu] manifest is empty — skipping.");
+    console.log("[feishu] manifest is empty - skipping.");
     return;
   }
+
   const { date, reports } = latest;
 
   let highlights: Highlights | null = null;
@@ -133,20 +134,13 @@ async function main(): Promise<void> {
     try {
       highlights = JSON.parse(fs.readFileSync(highlightsPath, "utf-8")) as Highlights;
     } catch {
-      console.log("[feishu] Failed to parse highlights.json — sending without highlights.");
+      console.log("[feishu] Failed to parse highlights.json - sending without highlights.");
     }
   }
 
-  const isMonthly = reports.some((r) => r === "ai-monthly");
-  const isWeekly = reports.some((r) => r === "ai-weekly");
-  const icon = isMonthly ? "📆" : isWeekly ? "📅" : "📡";
-  const suffix = isMonthly ? " 月报" : isWeekly ? " 周报" : "";
-  const title = `${icon} agents-radar${suffix} · ${date}`;
-
-  const content = buildFeishuMessage(date, reports, undefined, highlights);
-
-  console.log(`[feishu] Sending to ${urls.length} webhook(s) for ${date} (${reports.length} reports)…`);
-  await sendFeishu(title, content);
+  const text = buildFeishuText(date, reports, highlights);
+  console.log(`[feishu] Sending to chat ${process.env["FEISHU_CHAT_ID"]} for ${date}...`);
+  await sendFeishu(text);
   console.log("[feishu] Done!");
 }
 
